@@ -3,197 +3,79 @@ import os
 import threading
 import time
 from queue import Queue
-from dotenv import load_dotenv
+from datetime import datetime
 
 import numpy as np
 import transformers
-import sounddevice as sd
-import whisper
-from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_openai import ChatOpenAI
-from rich.console import Console
-
-from sentiment import load_model, SentimentPrediction
-from tts_service import TextToSpeechService
 
 transformers.logging.set_verbosity_error()
+
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+from rich.rule import Rule
+from rich.box import ROUNDED
+from pathlib import Path
+
+from src.agent import get_llm_response
+from src.sentiment import analyze_emotion
+from src.stt_service import transcribe
+from src.tts_service import  TextToSpeechService
+from src.utils import play_audio, record_audio
+
 load_dotenv()
 
-project_root = os.getenv("PROJECT_ROOT")
+PROJECT_ROOT = Path(__file__).resolve().parent
+CACHE_DIR = PROJECT_ROOT / "hf_cache"
+CACHE_DIR.mkdir(exist_ok=True)
 
-os.environ["HF_HOME"] = os.path.join(project_root, os.getenv("HF_HOME"))
-os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
-os.environ["OPENROUTER_API_KEY"] = os.getenv("OPENROUTER_API_KEY")
-os.environ["XDG_CACHE_HOME"] = os.path.join(project_root, os.getenv("XDG_CACHE_HOME"))
-os.environ["TRANSFORMERS_CACHE"] = os.path.join(project_root, os.getenv("TRANSFORMERS_CACHE"))
-os.environ["TORCH_HOME"] = os.path.join(project_root, os.getenv("TORCH_HOME"))
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+os.environ["HF_HOME"] = str(CACHE_DIR)
+os.environ["XDG_CACHE_HOME"] = str(CACHE_DIR / "whisper")
+os.environ["TORCH_HOME"] = str(CACHE_DIR / "torch")
+os.environ["TRANSFORMERS_CACHE"] = str(CACHE_DIR)
 
-console = Console()
+os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN", "")
+os.environ["OPENROUTER_API_KEY"] = os.getenv("OPENROUTER_API_KEY", "")
 
-stt = whisper.load_model("medium")
+console = Console(width=100)
+
 tts = TextToSpeechService()
-sentiment_model = load_model()
 
 parser = argparse.ArgumentParser(description="Local Voice Assistant with Bark TTS")
-parser.add_argument("--model", type=str, default="stepfun/step-3.5-flash:free")
+parser.add_argument("--model", type=str, default="minimax/minimax-m2.5:free")
 parser.add_argument("--save-voice", action="store_true")
 args = parser.parse_args()
 
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are a helpful and friendly AI assistant. 
-    You are polite, respectful, and aim to provide concise responses of less than 20 words."""),
-    MessagesPlaceholder(variable_name="history"),
-    ("human", "{input}")
-])
-
-llm = ChatOpenAI(
-    model=args.model,
-    temperature=0.6,
-    api_key=os.environ["OPENROUTER_API_KEY"],
-    base_url="https://openrouter.ai/api/v1",
-    timeout=15
-)
-
-chain = prompt | llm
-
-chat_sessions = {}
-
-
-def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
-    """
-    Get or create chat history for a session.
-
-    Args:
-        session_id (str): Unique session identifier.
-
-    Returns:
-        InMemoryChatMessageHistory: The chat history object.
-    """
-    if session_id not in chat_sessions:
-        chat_sessions[session_id] = InMemoryChatMessageHistory()
-    return chat_sessions[session_id]
-
-
-chain_with_history = RunnableWithMessageHistory(
-    chain,
-    get_session_history,
-    input_messages_key="input",
-    history_messages_key="history"
-)
-
-
-def record_audio(stop_event, data_queue):
-    """
-    Captures audio data from the user's microphone and adds it to a queue for further processing.
-
-    Args:
-        stop_event (threading.Event): An event that, when set, signals the function to stop recording.
-        data_queue (queue.Queue): A queue to which the recorded audio data will be added.
-
-    Returns:
-        None
-    """
-    def callback(indata, frames, time, status):
-        if status:
-            console.print(status)
-        data_queue.put(bytes(indata))
-
-    with sd.RawInputStream(
-        samplerate=16000, dtype="int16", channels=1, callback=callback
-    ):
-        while not stop_event.is_set():
-            time.sleep(0.1)
-
-
-def transcribe(audio_array: np.ndarray) -> str:
-    """
-    Transcribes the given audio data using the Whisper speech recognition model.
-
-    Args:
-        audio_array (numpy.ndarray): The audio data to be transcribed.
-
-    Returns:
-        str: The transcribed text.
-    """
-    result = stt.transcribe(audio_array, fp16=False)
-    return result["text"].strip()
-
-
-def get_llm_response(text: str) -> str:
-    """
-    Generates a response to the given text using the language model.
-
-    Args:
-        text (str): The input text to be processed.
-
-    Returns:
-        str: The generated response.
-    """
-    session_id = "voice_assistant_session"
-    response = chain_with_history.invoke(
-        {"input": text},
-        config={"session_id": session_id}
-    )
-    return (response.content or "").strip()
-
-
-def play_audio(sample_rate, audio_array):
-    """
-    Plays the given audio data using the sounddevice library.
-
-    Args:
-        sample_rate (int): The sample rate of the audio data.
-        audio_array (numpy.ndarray): The audio data to be played.
-
-    Returns:
-        None
-    """
-    sd.play(audio_array, sample_rate)
-    sd.wait()
-
-
-def analyze_emotion(text: str) -> SentimentPrediction:
-    """
-    Emotion analysis for dynamically adjusting exaggeration.
-
-    Returns a SentimentPrediction object containing:
-        sentiment_label: the mood label (e.g., 'positive', 'negative', 'neutral')
-        sentiment_score: a numeric mood score from the model
-    """
-
-    if not text:
-        return SentimentPrediction("neutral", 0.0)
-
-    text = text.strip()
-    sentiment = sentiment_model(text)
-    return SentimentPrediction(
-        label=sentiment.label,
-        score=sentiment.score
-    )
-
-
 if __name__ == "__main__":
-    console.print("[cyan]🤖 Local Voice Assistant with Bark TTS")
-    console.print("[cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    header = Panel(
+        Text("🤖 LOCAL VOICE ASSISTANT", style="bold cyan", justify="center")
+        + Text(f"\n⚡ Powered by Bark TTS & OpenRouter | 🕒 {datetime.now().strftime('%H:%M:%S')}",
+               style="dim blue", justify="center"),
+        box=ROUNDED,
+        border_style="cyan",
+        title="[bold magenta]VOICE AI[/bold magenta]",
+        subtitle="[dim]Нажмите Ctrl+C для выхода[/dim]"
+    )
+    console.print(header)
+    console.print(Rule(style="dim cyan"))
 
     if args.save_voice:
         os.makedirs("voices", exist_ok=True)
 
     response_count = 0
+    start_time = time.time()
 
     try:
         while True:
-            console.input("🎤 Press Enter to start recording, then press Enter again to stop.")
+            # 🎤 Запрос на запись
+            console.print(Text("🎤 Готов к записи. Нажмите Enter чтобы начать, и Enter снова чтобы остановить.", style="bold yellow"))
+            console.input("[bold green]▶ [/bold green]")
 
             data_queue = Queue()
             stop_event = threading.Event()
-            recording_thread = threading.Thread(
-                target=record_audio,
-                args=(stop_event, data_queue)
-            )
+            recording_thread = threading.Thread(target=record_audio, args=(stop_event, data_queue))
             recording_thread.start()
 
             input()
@@ -206,35 +88,69 @@ if __name__ == "__main__":
             )
 
             if audio_array.size == 0:
-                console.print("[red]No audio recorded. Please ensure your microphone is working.")
+                console.print(Panel(
+                    "⚠️ Аудио не записано. Проверьте микрофон и разрешения приложения.",
+                    title="[bold red]Ошибка записи[/bold red]",
+                    border_style="red",
+                    box=ROUNDED
+                ))
                 continue
 
-            with console.status("Transcribing...", spinner="dots"):
+            with console.status("🎧 Распознавание речи...", spinner="dots", spinner_style="cyan"):
                 text = transcribe(audio_array)
 
-            console.print(f"[yellow]You: {text}")
+            console.print(Panel(
+                f"🗣️ {text}",
+                title="[bold yellow]ВЫ[/bold yellow]",
+                border_style="yellow",
+                box=ROUNDED
+            ))
 
-            with console.status("Generating response...", spinner="dots"):
+            with console.status("🧠 Генерация ответа...", spinner="dots", spinner_style="green"):
                 response = get_llm_response(text)
-
                 sentiment = analyze_emotion(response)
                 label = sentiment.label
                 score = sentiment.score
-
                 sample_rate, audio_out = tts.long_form_synthesize(response)
 
-            console.print(f"[cyan]Assistant: {response}")
-            console.print(f"[dim](Emotion: {label}, Score: {score:.2f})[/dim]")
+            console.print(Panel(
+                f"💬 {response}\n\n[dim]🎭 Эмоция: {label} | Уверенность: {score:.2f}[/dim]",
+                title="[bold cyan]АССИСТЕНТ[/bold cyan]",
+                border_style="cyan",
+                box=ROUNDED
+            ))
 
             if args.save_voice:
                 response_count += 1
                 filename = f"voices/response_{response_count:03d}.wav"
                 tts.save_voice_sample(response, filename)
-                console.print(f"[dim]Voice saved to: {filename}[/dim]")
+                console.print(Panel(
+                    f"💾 Голосовой образец сохранён: {filename}",
+                    title="[bold green]Сохранено[/bold green]",
+                    border_style="green",
+                    box=ROUNDED,
+                    style="dim"
+                ))
 
             play_audio(sample_rate, audio_out)
 
-    except KeyboardInterrupt:
-        console.print("\n[red]Exiting...")
+            elapsed = time.time() - start_time
+            mins, secs = divmod(int(elapsed), 60)
+            console.print(Rule(style="dim"))
+            console.print(f"[dim]📊 Статистика: {response_count} ответов | ⏱️ {mins:02d}:{secs:02d}[/dim]")
+            console.print(Rule(style="dim"))
 
-    console.print("[blue]Session ended. Thank you for using the Voice Assistant!")
+    except KeyboardInterrupt:
+        elapsed = time.time() - start_time
+        mins, secs = divmod(int(elapsed), 60)
+        console.print("\n")
+        console.print(Panel(
+            f"👋 Сессия завершена.\n⏱️ Общее время: {mins:02d}:{secs:02d}\n💬 Всего ответов: {response_count}",
+            title="[bold blue]Завершение[/bold blue]",
+            border_style="blue",
+            box=ROUNDED
+        ))
+
+    console.print("[blue]✨ Спасибо за использование голосового ассистента!")
+
+

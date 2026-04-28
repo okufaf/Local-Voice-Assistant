@@ -5,7 +5,6 @@ import yaml
 from pydantic import BaseModel
 from transformers import pipeline
 
-
 config_path = Path(__file__).parent / 'config.yaml'
 with open(config_path, 'r') as file:
     config = yaml.load(file, Loader=yaml.FullLoader)
@@ -36,3 +35,25 @@ def load_model():
 
     return model
 
+
+sentiment_model = load_model()
+
+
+def analyze_emotion(text: str) -> SentimentPrediction:
+    """
+    Emotion analysis for dynamically adjusting exaggeration.
+
+    Returns a SentimentPrediction object containing:
+        sentiment_label: the mood label (e.g., 'positive', 'negative', 'neutral')
+        sentiment_score: a numeric mood score from the model
+    """
+
+    if not text:
+        return SentimentPrediction("neutral", 0.5)
+
+    text = text.strip()
+    sentiment = sentiment_model(text)
+    return SentimentPrediction(
+        label=sentiment.label,
+        score=sentiment.score
+    )
